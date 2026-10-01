@@ -17,7 +17,7 @@ from ..models import SUBJECT_AREAS, Copy, Loan, Member, Title
 from ..security import current_member, require_roles
 from ..serializers import availability_map, title_out
 from ..services import circulation as circ
-from ..services import grok, settings_store
+from ..services import grok, settings_store, vector_store
 from ..services import search as search_service
 from ..services.grok import GrokUnavailable
 from ..timeutil import utcnow
@@ -96,10 +96,18 @@ async def assistant(body: AssistantIn, member: Member = Depends(_rate_limit), db
 
     filters = {"subject_area": intent["subject_area"] if intent["subject_area"] in SUBJECT_AREAS else None,
                "available_only": bool(intent["available_only"])}
-    found = search_service.search_titles(db, str(intent["keywords"])[:200], filters, 1, 6, member.id)
-    if not found["results"] and (filters["subject_area"] or filters["available_only"]):  # relax filters first
-        found = search_service.search_titles(db, str(intent["keywords"])[:200], {}, 1, 6, member.id)
-    candidates = found["results"]
+    if vector_store.is_configured():
+        candidate_ids = vector_store.semantic_search(str(intent["keywords"])[:200], filters, top_k=8)
+        if not candidate_ids:
+            candidate_ids = vector_store.semantic_search(str(intent["keywords"])[:200], {}, top_k=8)
+        avail = availability_map(db, candidate_ids)
+        title_objs = {t.id: t for t in db.scalars(select(Title).where(Title.id.in_(candidate_ids)))}
+        candidates = [title_out(title_objs[i], avail[i]) for i in candidate_ids if i in title_objs]
+    else:
+        found = search_service.search_titles(db, str(intent["keywords"])[:200], filters, 1, 6, member.id)
+        if not found["results"] and (filters["subject_area"] or filters["available_only"]):
+            found = search_service.search_titles(db, str(intent["keywords"])[:200], {}, 1, 6, member.id)
+        candidates = found["results"]
 
     # Step 2: answer using only what the library holds, plus this member's own account facts
     now = utcnow()
@@ -168,16 +176,30 @@ async def recommendations(member: Member = Depends(_rate_limit), db: Session = D
     borrowed = set(db.scalars(select(Copy.title_id).join(Loan, Loan.copy_id == Copy.id).where(Loan.member_id == member.id)))
     excluded = list(borrowed) or [0]
     pool: list[Title] = []
-    if member.department:
-        pool = list(db.scalars(select(Title).where(
-            Title.retired.is_(False), Title.id.notin_(excluded), Title.department.ilike(f"%{member.department}%"))
-            .order_by(Title.year.desc()).limit(20)))
-    if len(pool) < 8:  # top up with what other members borrow most
-        taken = list(borrowed | {t.id for t in pool}) or [0]
-        pool += list(db.scalars(
-            select(Title).join(Copy, Copy.title_id == Title.id).join(Loan, Loan.copy_id == Copy.id)
-            .where(Title.retired.is_(False), Title.id.notin_(taken))
-            .group_by(Title.id).order_by(func.count(Loan.id).desc()).limit(10)))
+
+    if vector_store.is_configured() and borrowed:
+        sim_ids: set[int] = set()
+        for tid in list(borrowed)[-5:]:
+            sim_ids.update(vector_store.similar_to(tid, top_k=6))
+        sim_ids -= borrowed
+        if sim_ids:
+            pool = list(db.scalars(
+                select(Title).where(Title.retired.is_(False), Title.id.in_(list(sim_ids)))
+            ))
+
+    if len(pool) < 8:
+        if member.department:
+            dept_ids = {t.id for t in pool}
+            pool += list(db.scalars(select(Title).where(
+                Title.retired.is_(False), Title.id.notin_(list(borrowed | dept_ids)),
+                Title.department.ilike(f"%{member.department}%"))
+                .order_by(Title.year.desc()).limit(20 - len(pool))))
+        if len(pool) < 8:
+            taken = list(borrowed | {t.id for t in pool}) or [0]
+            pool += list(db.scalars(
+                select(Title).join(Copy, Copy.title_id == Title.id).join(Loan, Loan.copy_id == Copy.id)
+                .where(Title.retired.is_(False), Title.id.notin_(taken))
+                .group_by(Title.id).order_by(func.count(Loan.id).desc()).limit(10)))
     if not pool:
         return {"ai": False, "recommendations": []}
     avail = availability_map(db, [t.id for t in pool])

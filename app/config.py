@@ -24,6 +24,9 @@ class Config(BaseSettings):
     grok_model: str = "grok-4.3"
     grok_timeout_seconds: int = 45
 
+    pinecone_api_key: str = ""
+    pinecone_index: str = "nitt-library"
+
     smtp_host: str = ""
     smtp_port: int = 587
     smtp_user: str = ""

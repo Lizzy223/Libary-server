@@ -1,4 +1,4 @@
-from datetime import timedelta
+from datetime import timedelta, datetime, timezone
 
 import bcrypt
 import jwt
@@ -32,7 +32,7 @@ def verify_password(password: str, hashed: str | None) -> bool:
 
 
 def make_token(member: Member) -> str:
-    now = utcnow()
+    now = datetime.now(timezone.utc)
     ttl = STAFF_SESSION if member.role in STAFF_ROLES else MEMBER_SESSION
     payload = {"sub": str(member.id), "role": member.role, "iat": int(now.timestamp()),
                "exp": int((now + ttl).timestamp())}

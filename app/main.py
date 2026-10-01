@@ -1,4 +1,5 @@
 import logging
+import threading
 from contextlib import asynccontextmanager
 
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -8,9 +9,10 @@ from sqlalchemy import func, select
 
 from .config import get_config
 from .database import Base, SessionLocal, engine
-from .models import Member
+from .models import Member, Title
 from .routers import admin, ai, auth, catalogue, circulation, fines, members, reports
 from .security import client_ip, hash_password
+from .services import vector_store
 from .services.audit import request_ip
 from .services.notifications import dispatch_pending_emails
 
@@ -36,6 +38,24 @@ def _email_tick() -> None:
         db.commit()
 
 
+def _pinecone_sync() -> None:
+    """Populate the Pinecone index on startup if it is empty or stale."""
+    try:
+        with SessionLocal() as db:
+            titles = list(db.scalars(select(Title).where(Title.retired.is_(False))))
+        if not titles:
+            return
+        stats = vector_store.get_index().describe_index_stats()
+        if stats.total_vector_count >= len(titles) * 0.9:
+            log.info("Pinecone index already populated (%d vectors).", stats.total_vector_count)
+            return
+        log.info("Pinecone index has %d vectors, DB has %d titles — syncing.",
+                 stats.total_vector_count, len(titles))
+        vector_store.upsert_batch(titles)
+    except Exception as exc:
+        log.warning("Pinecone startup sync failed: %s", exc)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(engine)  # fine for a prototype; adopt Alembic before the schema changes in production
@@ -43,6 +63,8 @@ async def lifespan(app: FastAPI):
     if cfg.seed_demo_data:
         from .seed import seed_demo
         seed_demo()
+    if vector_store.is_configured():
+        threading.Thread(target=_pinecone_sync, daemon=True).start()
     scheduler = None
     if cfg.run_scheduler:
         scheduler = BackgroundScheduler(timezone="Africa/Lagos")

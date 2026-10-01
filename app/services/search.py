@@ -1,11 +1,12 @@
-"""Typo-tolerant catalogue search (SRCH-1..4). SQL applies the filters, RapidFuzz ranks the text.
-For 100,000 records this stays fast because only (id, search_text) pairs are scored, in C++."""
+"""Typo-tolerant catalogue search (SRCH-1..4). Uses Pinecone for semantic search when configured;
+falls back to RapidFuzz fuzzy matching otherwise."""
 from rapidfuzz import fuzz, process
 from sqlalchemy import exists, select
 from sqlalchemy.orm import Session
 
 from ..models import Copy, SearchLog, Title
 from ..serializers import availability_map, title_out
+from . import vector_store
 
 FUZZY_CUTOFF = 68
 
@@ -31,9 +32,20 @@ def _filtered_ids_stmt(f: dict):
 def search_titles(db: Session, q: str | None, filters: dict, page: int, page_size: int,
                   member_id: int | None = None) -> dict:
     q = (q or "").strip().lower()
-    stmt = _filtered_ids_stmt(filters)
 
-    if q:
+    if q and vector_store.is_configured():
+        ids = vector_store.semantic_search(q, filters, top_k=200)
+        if filters.get("available_only") and ids:
+            avail_set = set(db.scalars(
+                select(Copy.title_id).where(
+                    Copy.title_id.in_(ids),
+                    Copy.status == "available",
+                    Copy.collection != "reference_only",
+                )
+            ))
+            ids = [i for i in ids if i in avail_set]
+    elif q:
+        stmt = _filtered_ids_stmt(filters)
         rows = db.execute(stmt).all()
         texts = {tid: text for tid, text in rows}
         hits = process.extract(q, texts, scorer=fuzz.WRatio, score_cutoff=FUZZY_CUTOFF, limit=300)
@@ -44,6 +56,7 @@ def search_titles(db: Session, q: str | None, filters: dict, page: int, page_siz
         ranked.sort(key=lambda x: -x[0])
         ids = [tid for _, tid in ranked]
     else:
+        stmt = _filtered_ids_stmt(filters)
         ids = [tid for (tid, _) in db.execute(stmt.order_by(Title.title)).all()]
 
     total = len(ids)

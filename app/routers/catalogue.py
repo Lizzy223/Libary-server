@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Query, Response, UploadFile
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -7,7 +7,7 @@ from ..database import get_db
 from ..models import COLLECTIONS, COPY_STATUSES, FORMATS, SUBJECT_AREAS, AuditLog, Copy, Loan, Member, Title
 from ..security import any_staff, optional_member, require_roles
 from ..serializers import availability_map, copy_out, iso, title_out
-from ..services import search as search_service
+from ..services import search as search_service, vector_store
 from ..services.audit import audit, snap
 from .files import csv_response_body, read_rows
 
@@ -151,7 +151,8 @@ def get_title(title_id: int, member: Member | None = Depends(optional_member), d
 
 # -------------------------------------------------------------- cataloguing
 @router.post("/titles")
-def create_title(body: TitleIn, actor: Member = Depends(CATALOGUER), db: Session = Depends(get_db)):
+def create_title(body: TitleIn, background_tasks: BackgroundTasks,
+                 actor: Member = Depends(CATALOGUER), db: Session = Depends(get_db)):
     data = body.model_dump()
     _validate(data)
     copies_n = data.pop("copies")
@@ -168,11 +169,13 @@ def create_title(body: TitleIn, actor: Member = Depends(CATALOGUER), db: Session
     made = _add_copies(db, t, copies_n, shelf, collection, cost)
     audit(db, actor, "title.create", "title", t.id, after={**snap(t, TITLE_FIELDS), "copies": len(made)})
     db.commit()
+    background_tasks.add_task(vector_store.upsert_title, t)
     return {**title_out(t, availability_map(db, [t.id])[t.id]), "copies": [copy_out(c) for c in made]}
 
 
 @router.patch("/titles/{title_id}")
-def update_title(title_id: int, body: TitlePatch, actor: Member = Depends(CATALOGUER), db: Session = Depends(get_db)):
+def update_title(title_id: int, body: TitlePatch, background_tasks: BackgroundTasks,
+                 actor: Member = Depends(CATALOGUER), db: Session = Depends(get_db)):
     t = db.get(Title, title_id)
     if not t:
         raise HTTPException(404, "Title not found.")
@@ -189,11 +192,13 @@ def update_title(title_id: int, body: TitlePatch, actor: Member = Depends(CATALO
     t.refresh_search_text()
     audit(db, actor, "title.update", "title", t.id, before=before, after=snap(t, TITLE_FIELDS))  # CAT-7
     db.commit()
+    background_tasks.add_task(vector_store.upsert_title, t)
     return title_out(t, availability_map(db, [t.id])[t.id])
 
 
 @router.post("/titles/{title_id}/retire")
-def retire_title(title_id: int, actor: Member = Depends(CATALOGUER), db: Session = Depends(get_db)):
+def retire_title(title_id: int, background_tasks: BackgroundTasks,
+                 actor: Member = Depends(CATALOGUER), db: Session = Depends(get_db)):
     """CAT-8: records are never deleted; titles with loan history are retired instead."""
     t = db.get(Title, title_id)
     if not t:
@@ -205,6 +210,7 @@ def retire_title(title_id: int, actor: Member = Depends(CATALOGUER), db: Session
     t.retired = True
     audit(db, actor, "title.retire", "title", t.id)
     db.commit()
+    background_tasks.add_task(vector_store.delete_title, title_id)
     return {"ok": True}
 
 
@@ -291,13 +297,14 @@ def import_template(_: Member = Depends(CATALOGUER)):
 
 
 @router.post("/import")
-async def import_titles(dry_run: bool = True, file: UploadFile = File(...), actor: Member = Depends(CATALOGUER),
-                        db: Session = Depends(get_db)):
+async def import_titles(dry_run: bool = True, file: UploadFile = File(...), background_tasks: BackgroundTasks = None,
+                        actor: Member = Depends(CATALOGUER), db: Session = Depends(get_db)):
     """CAT-4 / DR-4: validate every row, detect duplicates on ISBN + edition, then commit only when dry_run=false."""
     rows = await read_rows(file)
     created = copies_made = 0
     errors, duplicates = [], []
     seen: set[tuple] = set()
+    new_titles: list[Title] = []
     for i, row in enumerate(rows, start=2):
         title = row.get("title", "")
         isbn = _norm_isbn(row.get("isbn"))
@@ -339,6 +346,7 @@ async def import_titles(dry_run: bool = True, file: UploadFile = File(...), acto
         db.add(t)
         db.flush()
         copies_made += len(_add_copies(db, t, n_copies, row.get("shelf_location") or None, collection, cost))
+        new_titles.append(t)
         created += 1
     if dry_run:
         db.rollback()
@@ -346,5 +354,7 @@ async def import_titles(dry_run: bool = True, file: UploadFile = File(...), acto
         audit(db, actor, "title.import", "title", None,
               after={"titles": created, "copies": copies_made, "duplicates": len(duplicates), "errors": len(errors)})
         db.commit()
+        if background_tasks is not None:
+            background_tasks.add_task(vector_store.upsert_batch, new_titles)
     return {"dry_run": dry_run, "titles_created": created, "copies_created": copies_made,
             "duplicates": duplicates, "errors": errors, "rows_read": len(rows)}
