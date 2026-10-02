@@ -35,7 +35,7 @@ class Config(BaseSettings):
 
     @property
     def db_url(self) -> str:
-        url = self.database_url
+        url = self.database_url.strip() or "sqlite:///./library.db"
         # Hosted Postgres providers hand out postgres:// or postgresql:// URLs
         if url.startswith("postgres://"):
             url = url.replace("postgres://", "postgresql+psycopg://", 1)
